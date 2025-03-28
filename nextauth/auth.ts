@@ -2,9 +2,9 @@ import NextAuth from 'next-auth';
 import { authConfig } from './auth.config';
 import Google from "next-auth/providers/google";
 import CredentialsProvider from 'next-auth/providers/credentials';
-import { z } from 'zod';
+import { signInSchema } from "@/src/lib/zod"
+import { createUser, getUserByEmail } from '@/src/utils/db';
 import bcrypt from 'bcrypt';
-import prisma from '@/src/lib/prisma';
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
     ...authConfig,
@@ -25,48 +25,32 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         // Credentials Provider for email/password login
         CredentialsProvider({
             credentials: {
-                email: { label: 'Email', type: 'text' },
+                email: { label: 'Email', type: 'email' },
                 password: { label: 'Password', type: 'password' },
             },
             async authorize(credentials: any) {
-                const parsedCredentials = z
-                    .object({
-                        email: z.string().email(),
-                        password: z.string().min(8),
-                    })
-                    .safeParse(credentials);
-
-                if (!parsedCredentials.success) {
-                    console.error('Invalid credentials format!');
-                    return null;
-                }
-
-                const { email, password } = parsedCredentials.data;
-
                 try {
-                    const user = await prisma.users.findUnique({
-                        where: { email: email },
-                    });
+                    const { email, password } = await signInSchema.parseAsync(credentials);
+                    const user = await getUserByEmail(email);
 
-                    if (user && (await bcrypt.compare(password, user.password))) {
-                        return {
-                            id: user.id.toString(),
-                            email: user.email,
-                            name: `${user.firstname} ${user.lastname}`,
-                        };
-                    } else {
-                        console.error('Authentication failed!');
-                        return null;
+                    if (!user || !await bcrypt.compare(password, user.password)) {
+                        throw new Error("Invalid credentials.")
                     }
+
+                    return {
+                        id: user.id.toString(),
+                        email: user.email,
+                        name: `${user.firstname} ${user.lastname}`,
+                    };
                 } catch (error) {
-                    console.error('Authentication error:', error);
+                    console.error('Authentication error: ', error);
                     return null;
                 }
             },
         }),
     ],
     callbacks: {
-        async signIn({ account, profile }: { account: any; profile: any }) {
+        async signIn({ account, profile }) {
             // Handle Google sign-in
             if (account && account.provider === "google") {
                 try {
@@ -74,9 +58,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
                         return '/login';
 
                     // Check if the user already exists in the database
-                    let existingUser = await prisma.users.findUnique({
-                        where: { email: profile.email },
-                    });
+                    const existingUser = await getUserByEmail(profile.email);
 
                     if (existingUser && existingUser.provider !== "google") {
                         const redirectURL = `/login?provider=${existingUser.provider}`;
@@ -84,18 +66,9 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
                     }
 
                     if (!existingUser) {
-                        // Create a new user if they don't exist
-                        existingUser = await prisma.users.create({
-                            data: {
-                                email: profile.email,
-                                firstname: profile.name.split(" ")[0],
-                                lastname: profile.name.split(" ")[1] || "",
-                                password: '',
-                                provider: 'google'
-                            },
-                        });
+                        await createUser(profile.email, profile.name.split(" ")[0], profile.name.split(" ")[1] || "", '', 'google');
                     }
-
+                    
                     return true; // Allow sign-in
                 } catch (error) {
                     console.error("Error during sign-in:", error);
@@ -113,12 +86,10 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
             }
             return session;
         },
-        async jwt({ token, trigger, user, account, session }: { token: any; trigger: any; user: any; account: any; session: any }) {
+        async jwt({ token, trigger, user, account, session }) {
             if (account?.provider === "google" && user?.email) {
                 try {
-                    const dbUser = await prisma.users.findUnique({
-                        where: { email: user.email },
-                    });
+                    const dbUser = await getUserByEmail(user.email);
 
                     if (dbUser) {
                         token.id = dbUser.id.toString();
